@@ -1,13 +1,16 @@
 """
-Canvas LMS REST API scraper.
-Uses Bearer token auth — no cookie/session needed.
-Docs: https://canvas.instructure.com/doc/api/
+Scrapers:
+  - CanvasScraper   : Canvas LMS REST API (Bearer token)
+  - DeptScraper     : ceng.eskisehir.edu.tr/tr/Duyuru (HTML scraping)
 """
 
 import logging
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
+from urllib.parse import urljoin
 
 import requests
+from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +20,7 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "application/json",
+    "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8",
 }
 
 
@@ -27,11 +30,36 @@ class Announcement:
     subject: str
     class_name: str
     link: str
+    content: str = field(default="")
 
 
 class TokenExpiredError(Exception):
-    """Raised when Canvas returns 401 Unauthorized."""
+    """Canvas returned 401 — token invalid or expired."""
 
+
+# ─────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────
+
+def _html_to_text(html: str, max_chars: int = 900) -> str:
+    """Strip HTML tags and collapse whitespace."""
+    if not html:
+        return ""
+    soup = BeautifulSoup(html, "lxml")
+    # Replace <br>/<p> with newlines before stripping
+    for tag in soup.find_all(["br", "p", "li"]):
+        tag.insert_before("\n")
+    text = soup.get_text(separator=" ")
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ \t]+", " ", text).strip()
+    if len(text) > max_chars:
+        text = text[:max_chars].rstrip() + "…"
+    return text
+
+
+# ─────────────────────────────────────────────────────────────
+# Canvas scraper
+# ─────────────────────────────────────────────────────────────
 
 class CanvasScraper:
     def __init__(self, base_url: str, access_token: str, timeout: int = 30):
@@ -40,65 +68,46 @@ class CanvasScraper:
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
         self.session.headers["Authorization"] = f"Bearer {access_token}"
+        self.session.headers["Accept"] = "application/json"
 
     def _get_json(self, path: str, params: dict | None = None) -> list | dict:
         url = f"{self.base_url}{path}"
         results = []
         while url:
             resp = self.session.get(url, params=params, timeout=self.timeout)
-
             if resp.status_code == 401:
                 raise TokenExpiredError(
-                    "Canvas returned 401 Unauthorized. Access token is invalid or expired."
+                    "Canvas 401 Unauthorized — access token is invalid or expired."
                 )
             resp.raise_for_status()
-
             data = resp.json()
             if isinstance(data, list):
                 results.extend(data)
             else:
                 return data
-
-            # Canvas paginates via Link header
             url = self._next_page(resp)
-            params = None  # params already in next URL
-
+            params = None
         return results
 
     @staticmethod
     def _next_page(resp: requests.Response) -> str | None:
-        link_header = resp.headers.get("Link", "")
-        for part in link_header.split(","):
+        for part in resp.headers.get("Link", "").split(","):
             if 'rel="next"' in part:
-                url = part.split(";")[0].strip().strip("<>")
-                return url
+                return part.split(";")[0].strip().strip("<>")
         return None
 
     def get_active_courses(self) -> list[dict]:
-        """Return all active enrolled courses."""
-        logger.info("Fetching active course list from Canvas")
-        courses = self._get_json(
-            "/api/v1/courses",
-            params={
-                "enrollment_state": "active",
-                "per_page": 100,
-                "include[]": "term",
-            },
-        )
-        logger.info("Found %d active courses", len(courses))
-        return courses
+        logger.info("Fetching active Canvas courses")
+        return self._get_json("/api/v1/courses", params={
+            "enrollment_state": "active", "per_page": 100
+        })
 
     def fetch_course_announcements(self, course_id: int | str, course_name: str) -> list[Announcement]:
-        """Fetch announcements for a single course via Canvas discussion_topics API."""
-        logger.debug("Fetching announcements for course %s (%s)", course_id, course_name)
+        logger.debug("Canvas: fetching announcements for %s", course_name)
         try:
             topics = self._get_json(
                 f"/api/v1/courses/{course_id}/discussion_topics",
-                params={
-                    "only_announcements": "true",
-                    "per_page": 50,
-                    "order_by": "recent_activity",
-                },
+                params={"only_announcements": "true", "per_page": 50, "order_by": "recent_activity"},
             )
         except requests.HTTPError as exc:
             if exc.response is not None and exc.response.status_code in (401, 403):
@@ -113,26 +122,25 @@ class CanvasScraper:
                 continue
             subject = topic.get("title") or "No subject"
             link = topic.get("html_url") or f"{self.base_url}/courses/{course_id}/discussion_topics/{ann_id}"
-            announcements.append(
-                Announcement(id=ann_id, subject=subject, class_name=course_name, link=link)
-            )
-
+            content = _html_to_text(topic.get("message", ""))
+            announcements.append(Announcement(
+                id=ann_id,
+                subject=subject,
+                class_name=course_name,
+                link=link,
+                content=content,
+            ))
         return announcements
 
     def fetch_all_announcements(self, course_ids: list) -> list[Announcement]:
-        """
-        Aggregate announcements across all courses.
-        If course_ids is empty, auto-discovers all active courses first.
-        """
         if course_ids:
-            # Use provided IDs; get names via API
             all_courses = []
             for cid in course_ids:
                 try:
-                    course = self._get_json(f"/api/v1/courses/{cid}")
-                    all_courses.append({"id": cid, "name": course.get("name", str(cid))})
+                    c = self._get_json(f"/api/v1/courses/{cid}")
+                    all_courses.append({"id": cid, "name": c.get("name", str(cid))})
                 except Exception as exc:
-                    logger.warning("Could not fetch course %s info: %s", cid, exc)
+                    logger.warning("Could not fetch course %s: %s", cid, exc)
                     all_courses.append({"id": cid, "name": str(cid)})
         else:
             raw = self.get_active_courses()
@@ -142,14 +150,13 @@ class CanvasScraper:
         for course in all_courses:
             try:
                 anns = self.fetch_course_announcements(course["id"], course["name"])
-                logger.info("  %s → %d announcement(s)", course["name"], len(anns))
+                logger.info("  Canvas %s → %d", course["name"], len(anns))
                 all_announcements.extend(anns)
             except TokenExpiredError:
                 raise
             except Exception as exc:
-                logger.warning("Failed for course %s: %s", course["name"], exc)
+                logger.warning("Canvas course %s failed: %s", course["name"], exc)
 
-        # Deduplicate by ID
         seen: set[str] = set()
         unique = []
         for ann in all_announcements:
@@ -157,5 +164,79 @@ class CanvasScraper:
                 seen.add(ann.id)
                 unique.append(ann)
 
-        logger.info("Total unique announcements fetched: %d", len(unique))
+        logger.info("Canvas total unique: %d", len(unique))
         return unique
+
+
+# ─────────────────────────────────────────────────────────────
+# Department website scraper
+# ─────────────────────────────────────────────────────────────
+
+DEPT_BASE = "https://ceng.eskisehir.edu.tr"
+DEPT_LIST = f"{DEPT_BASE}/tr/Duyuru"
+SOURCE_NAME = "CENG Bölüm Sitesi"
+
+
+class DeptScraper:
+    def __init__(self, timeout: int = 20):
+        self.timeout = timeout
+        self.session = requests.Session()
+        self.session.headers.update(HEADERS)
+
+    def _get_soup(self, url: str) -> BeautifulSoup:
+        resp = self.session.get(url, timeout=self.timeout)
+        resp.raise_for_status()
+        return BeautifulSoup(resp.text, "lxml")
+
+    def _fetch_content(self, detail_url: str) -> str:
+        """Fetch full announcement text from detail page."""
+        try:
+            soup = self._get_soup(detail_url)
+            content_div = soup.select_one(".gdlr-core-blog-content")
+            if content_div:
+                return _html_to_text(str(content_div), max_chars=900)
+        except Exception as exc:
+            logger.warning("Dept detail fetch failed (%s): %s", detail_url, exc)
+        return ""
+
+    def fetch_announcements(self) -> list[Announcement]:
+        logger.info("Dept: fetching %s", DEPT_LIST)
+        try:
+            soup = self._get_soup(DEPT_LIST)
+        except Exception as exc:
+            logger.warning("Dept list page failed: %s", exc)
+            return []
+
+        announcements = []
+        # Each announcement has 3 <a> tags with the same href (thumbnail, title, "Devamı").
+        # Only the one inside h3.gdlr-core-blog-title carries the real title.
+        links = soup.select('h3.gdlr-core-blog-title a[href*="/tr/Duyuru/Detay/"]')
+
+        seen_hrefs: set[str] = set()
+        for a in links:
+            href = a.get("href", "")
+            if not href or href in seen_hrefs:
+                continue
+            seen_hrefs.add(href)
+
+            title = a.get_text(strip=True)
+            if not title:
+                continue
+
+            # Use the URL slug as stable unique ID, prefixed to avoid collision with Canvas IDs
+            slug = href.rstrip("/").split("/")[-1]
+            ann_id = f"ceng_{slug}"
+            full_url = urljoin(DEPT_BASE, href)
+
+            content = self._fetch_content(full_url)
+
+            announcements.append(Announcement(
+                id=ann_id,
+                subject=title,
+                class_name=SOURCE_NAME,
+                link=full_url,
+                content=content,
+            ))
+
+        logger.info("Dept total: %d", len(announcements))
+        return announcements

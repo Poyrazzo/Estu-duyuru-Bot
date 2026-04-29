@@ -17,7 +17,7 @@ class TelegramNotifier:
             "chat_id": self.chat_id,
             "text": text,
             "parse_mode": parse_mode,
-            "disable_web_page_preview": False,
+            "disable_web_page_preview": True,
         }
         try:
             resp = requests.post(self._url, json=payload, timeout=15)
@@ -31,14 +31,19 @@ class TelegramNotifier:
             logger.error("Failed to send Telegram message: %s", exc)
             return False
 
-    def send_announcement(self, subject: str, class_name: str, link: str) -> bool:
+    def send_announcement(self, subject: str, class_name: str, link: str, content: str = "") -> bool:
+        content_line = ""
+        if content:
+            content_line = f"\n\n📄 <i>{self._escape(content)}</i>"
+
         text = (
             "📢 <b>Yeni Duyuru!</b>\n\n"
-            f"📚 <b>Ders:</b> {self._escape(class_name)}\n"
-            f"📌 <b>Konu:</b> {self._escape(subject)}\n"
-            f"🔗 <a href=\"{link}\">Duyuruyu Görüntüle</a>"
+            f"📚 <b>Kaynak:</b> {self._escape(class_name)}\n"
+            f"📌 <b>Konu:</b> {self._escape(subject)}"
+            f"{content_line}\n\n"
+            f"🔗 <a href=\"{link}\">{self._escape(link)}</a>"
         )
-        logger.info("Sending announcement notification: '%s' / '%s'", class_name, subject)
+        logger.info("Sending: [%s] %s", class_name, subject)
         return self._send_raw(text)
 
     def send_token_expired_alert(self) -> bool:
@@ -49,7 +54,7 @@ class TelegramNotifier:
             "yeni bir jeton oluşturun ve <code>config.json</code> içindeki "
             "<code>access_token</code> değerini güncelleyin."
         )
-        logger.warning("Sending token expired alert to Telegram")
+        logger.warning("Sending token expired alert")
         return self._send_raw(text)
 
     def send_error_alert(self, error_message: str) -> bool:
@@ -61,14 +66,14 @@ class TelegramNotifier:
 
     def send_startup_message(self) -> bool:
         text = (
-            "✅ <b>ESTÜ OYS Duyuru Botu Başlatıldı</b>\n\n"
-            "Duyurular izleniyor. Yeni duyuru geldiğinde buraya bildirim alacaksınız."
+            "✅ <b>ESTÜ Duyuru Botu Başlatıldı</b>\n\n"
+            "Canvas dersleri + Bilgisayar Mühendisliği bölüm sitesi izleniyor.\n"
+            "Yeni duyuru geldiğinde tam içerikle buraya bildirim alacaksınız."
         )
         return self._send_raw(text)
 
     @staticmethod
     def _escape(text: str) -> str:
-        """Minimal HTML escaping for Telegram HTML mode."""
         return (
             text.replace("&", "&amp;")
                 .replace("<", "&lt;")

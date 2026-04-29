@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-"""
-ESTÜ Canvas Duyuru Botu — Main Entry Point
-"""
+"""ESTÜ Canvas + Bölüm Sitesi Duyuru Botu — Main Entry Point"""
 
 import json
 import logging
@@ -13,7 +11,7 @@ from pathlib import Path
 from db import Database
 from notifier import TelegramNotifier
 from quiet_hours import is_quiet_now
-from scraper import CanvasScraper, TokenExpiredError
+from scraper import CanvasScraper, DeptScraper, TokenExpiredError
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
 
@@ -35,19 +33,12 @@ def load_config() -> dict:
 
 
 def validate_config(cfg: dict):
-    token = cfg["telegram"]["api_token"]
-    chat_id = cfg["telegram"]["chat_id"]
-    access_token = cfg["canvas"]["access_token"]
-
-    if token == "YOUR_TELEGRAM_BOT_TOKEN":
-        logger.error("Set your Telegram API token in config.json")
-        sys.exit(1)
-    if chat_id == "YOUR_CHAT_ID":
-        logger.error("Set your Telegram chat_id in config.json")
-        sys.exit(1)
-    if access_token == "YOUR_CANVAS_ACCESS_TOKEN":
-        logger.error("Set your Canvas access token in config.json")
-        sys.exit(1)
+    if cfg["telegram"]["api_token"] == "YOUR_TELEGRAM_BOT_TOKEN":
+        logger.error("Set Telegram token in config.json"); sys.exit(1)
+    if cfg["telegram"]["chat_id"] == "YOUR_CHAT_ID":
+        logger.error("Set Telegram chat_id in config.json"); sys.exit(1)
+    if cfg["canvas"]["access_token"] == "YOUR_CANVAS_ACCESS_TOKEN":
+        logger.error("Set Canvas access token in config.json"); sys.exit(1)
 
 
 class Bot:
@@ -57,16 +48,16 @@ class Bot:
 
         canvas_cfg = self.cfg["canvas"]
         tg_cfg = self.cfg["telegram"]
-        db_cfg = self.cfg["database"]
         self.quiet_cfg = self.cfg.get("quiet_hours", {"enabled": False})
 
-        self.db = Database(db_cfg["path"])
+        self.db = Database(self.cfg["database"]["path"])
         self.notifier = TelegramNotifier(tg_cfg["api_token"], tg_cfg["chat_id"])
-        self.scraper = CanvasScraper(
+        self.canvas = CanvasScraper(
             base_url=canvas_cfg["base_url"],
             access_token=canvas_cfg["access_token"],
             timeout=canvas_cfg.get("request_timeout_seconds", 30),
         )
+        self.dept = DeptScraper(timeout=canvas_cfg.get("request_timeout_seconds", 30))
         self.course_ids: list = canvas_cfg.get("course_ids", [])
         self.interval: int = canvas_cfg.get("check_interval_seconds", 600)
         self._running = True
@@ -75,88 +66,90 @@ class Bot:
         signal.signal(signal.SIGTERM, self._handle_stop)
 
     def _handle_stop(self, *_):
-        logger.info("Shutdown signal received. Stopping...")
+        logger.info("Shutdown signal received.")
         self._running = False
 
     def _flush_queued(self):
-        queued = self.db.flush_queue()
-        for item in queued:
+        for item in self.db.flush_queue():
             self.notifier.send_announcement(
                 subject=item["subject"],
                 class_name=item["class_name"],
                 link=item["link"],
+                content=item.get("content", ""),
             )
-            logger.info("Sent queued announcement: %s", item["ann_id"])
 
-    def _process_announcements(self):
+    def _process(self, announcements, in_quiet: bool):
+        new = 0
+        for ann in announcements:
+            if self.db.is_seen(ann.id):
+                continue
+            new += 1
+            self.db.mark_seen(ann.id, ann.subject, ann.class_name, ann.link)
+            if in_quiet:
+                self.db.enqueue(ann.id, ann.subject, ann.class_name, ann.link)
+                logger.info("Queued (quiet hours): [%s] %s", ann.class_name, ann.subject)
+            else:
+                ok = self.notifier.send_announcement(
+                    subject=ann.subject,
+                    class_name=ann.class_name,
+                    link=ann.link,
+                    content=ann.content,
+                )
+                if not ok:
+                    self.db.enqueue(ann.id, ann.subject, ann.class_name, ann.link)
+        return new
+
+    def _check_cycle(self):
         quiet_enabled = self.quiet_cfg.get("enabled", False)
-        quiet_start = self.quiet_cfg.get("start", "23:00")
-        quiet_end = self.quiet_cfg.get("end", "07:00")
-        in_quiet = quiet_enabled and is_quiet_now(quiet_start, quiet_end)
+        in_quiet = quiet_enabled and is_quiet_now(
+            self.quiet_cfg.get("start", "23:00"),
+            self.quiet_cfg.get("end", "07:00"),
+        )
 
         if not in_quiet and quiet_enabled:
             self._flush_queued()
 
+        total_new = 0
+
+        # Canvas
         try:
-            announcements = self.scraper.fetch_all_announcements(self.course_ids)
+            anns = self.canvas.fetch_all_announcements(self.course_ids)
+            total_new += self._process(anns, in_quiet)
         except TokenExpiredError as exc:
             logger.error("%s", exc)
             self.notifier.send_token_expired_alert()
-            return
+
+        # Department site
+        try:
+            anns = self.dept.fetch_announcements()
+            total_new += self._process(anns, in_quiet)
         except Exception as exc:
-            logger.error("Unexpected scraper error: %s", exc, exc_info=True)
-            return
+            logger.warning("Dept scraper error: %s", exc)
 
-        new_count = 0
-        for ann in announcements:
-            if self.db.is_seen(ann.id):
-                continue
-
-            new_count += 1
-            # Write to DB first — prevents duplicate sends on crash
-            self.db.mark_seen(ann.id, ann.subject, ann.class_name, ann.link)
-
-            if in_quiet:
-                logger.info("Quiet hours — queuing: [%s] %s", ann.class_name, ann.subject)
-                self.db.enqueue(ann.id, ann.subject, ann.class_name, ann.link)
-            else:
-                success = self.notifier.send_announcement(
-                    subject=ann.subject,
-                    class_name=ann.class_name,
-                    link=ann.link,
-                )
-                if not success:
-                    logger.warning("Notification failed for %s, queuing", ann.id)
-                    self.db.enqueue(ann.id, ann.subject, ann.class_name, ann.link)
-
-        if new_count == 0:
+        if total_new == 0:
             logger.info("No new announcements.")
         else:
-            logger.info("Processed %d new announcement(s).", new_count)
+            logger.info("Sent %d new notification(s).", total_new)
 
     def run(self):
         logger.info("=" * 60)
-        logger.info("ESTÜ Canvas Announcement Bot starting up")
-        logger.info("Interval: %ds | Courses: %s", self.interval, self.course_ids or "auto-discover")
+        logger.info("ESTÜ Duyuru Bot starting (Canvas + Bölüm Sitesi)")
+        logger.info("Interval: %ds | Courses: %s", self.interval, self.course_ids or "auto")
         logger.info("=" * 60)
 
         self.notifier.send_startup_message()
 
         consecutive_errors = 0
-        max_errors = 5
-
         while self._running:
             try:
                 logger.info("--- Check cycle ---")
-                self._process_announcements()
+                self._check_cycle()
                 consecutive_errors = 0
             except Exception as exc:
                 consecutive_errors += 1
-                logger.error("Unhandled error (%d/%d): %s", consecutive_errors, max_errors, exc, exc_info=True)
-                if consecutive_errors >= max_errors:
-                    msg = f"Bot stopped after {max_errors} consecutive errors: {exc}"
-                    logger.critical(msg)
-                    self.notifier.send_error_alert(msg)
+                logger.error("Unhandled error (%d/5): %s", consecutive_errors, exc, exc_info=True)
+                if consecutive_errors >= 5:
+                    self.notifier.send_error_alert(f"Bot stopped: {exc}")
                     sys.exit(1)
 
             for _ in range(self.interval):
@@ -164,7 +157,7 @@ class Bot:
                     break
                 time.sleep(1)
 
-        logger.info("Bot stopped cleanly.")
+        logger.info("Bot stopped.")
 
 
 if __name__ == "__main__":
