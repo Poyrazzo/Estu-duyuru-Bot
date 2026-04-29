@@ -1,0 +1,68 @@
+name: ESTÜ Canvas Duyuru Kontrolü
+
+on:
+  schedule:
+    # Runs every 15 minutes (GitHub minimum)
+    - cron: "*/15 * * * *"
+  workflow_dispatch:   # allows manual trigger from GitHub UI
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          # Need full history to commit DB back
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore announcement database
+        uses: actions/cache@v4
+        with:
+          path: announcements.db
+          # Cache key includes date so it refreshes daily, but restores the latest DB
+          key: announcements-db-${{ github.run_id }}
+          restore-keys: |
+            announcements-db-
+
+      - name: Write config from secrets
+        run: |
+          python - <<'EOF'
+          import json, os
+          cfg = {
+            "telegram": {
+              "api_token": os.environ["TELEGRAM_TOKEN"],
+              "chat_id":   os.environ["TELEGRAM_CHAT_ID"]
+            },
+            "canvas": {
+              "base_url":     "https://estuoys.eskisehir.edu.tr",
+              "access_token": os.environ["CANVAS_TOKEN"],
+              "course_ids":   [],
+              "check_interval_seconds": 600,
+              "request_timeout_seconds": 30
+            },
+            "quiet_hours": {"enabled": False, "start": "23:00", "end": "07:00"},
+            "database":    {"path": "announcements.db"}
+          }
+          with open("config.json", "w") as f:
+              json.dump(cfg, f, indent=2)
+          print("config.json written from secrets.")
+          EOF
+        env:
+          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          CANVAS_TOKEN:     ${{ secrets.CANVAS_TOKEN }}
+
+      - name: Run one-shot announcement check
+        run: python run_once.py

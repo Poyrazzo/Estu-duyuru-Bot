@@ -1,0 +1,17 @@
+[Unit]
+Description=ESTÜ OYS Duyuru Botu
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/poyrazzo/Desktop/my_Bots/Canvas_duyuru_bot
+ExecStart=/home/poyrazzo/Desktop/my_Bots/Canvas_duyuru_bot/venv/bin/python bot.py
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
