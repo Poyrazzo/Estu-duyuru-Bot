@@ -31,6 +31,7 @@ class Announcement:
     class_name: str
     link: str
     content: str = field(default="")
+    posted_at: str = field(default="")  # human-readable, e.g. "28 Nis 2026, 13:25"
 
 
 class TokenExpiredError(Exception):
@@ -40,6 +41,40 @@ class TokenExpiredError(Exception):
 # ─────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────
+
+_TR_MONTHS = {
+    "Jan": "Oca", "Feb": "Şub", "Mar": "Mar", "Apr": "Nis",
+    "May": "May", "Jun": "Haz", "Jul": "Tem", "Aug": "Ağu",
+    "Sep": "Eyl", "Oct": "Eki", "Nov": "Kas", "Dec": "Ara",
+}
+
+def _format_canvas_date(iso: str) -> str:
+    """Convert '2026-04-28T10:25:27Z' → '28 Nis 2026, 13:25' (UTC+3)."""
+    if not iso:
+        return ""
+    try:
+        from datetime import datetime, timezone, timedelta
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        dt = dt.astimezone(timezone(timedelta(hours=3)))
+        month_en = dt.strftime("%b")
+        month_tr = _TR_MONTHS.get(month_en, month_en)
+        return dt.strftime(f"%d {month_tr} %Y, %H:%M")
+    except Exception:
+        return iso
+
+
+def _format_dept_date(raw: str) -> str:
+    """Convert '28.04.2026 14:46:12' → '28 Nis 2026, 14:46'."""
+    if not raw:
+        return ""
+    try:
+        from datetime import datetime
+        dt = datetime.strptime(raw.strip(), "%d.%m.%Y %H:%M:%S")
+        month_tr = _TR_MONTHS.get(dt.strftime("%b"), dt.strftime("%b"))
+        return dt.strftime(f"%d {month_tr} %Y, %H:%M")
+    except Exception:
+        return raw
+
 
 def _html_to_text(html: str, max_chars: int = 900) -> str:
     """Strip HTML tags and collapse whitespace."""
@@ -123,12 +158,14 @@ class CanvasScraper:
             subject = topic.get("title") or "No subject"
             link = topic.get("html_url") or f"{self.base_url}/courses/{course_id}/discussion_topics/{ann_id}"
             content = _html_to_text(topic.get("message", ""))
+            posted_at = _format_canvas_date(topic.get("posted_at") or topic.get("created_at", ""))
             announcements.append(Announcement(
                 id=ann_id,
                 subject=subject,
                 class_name=course_name,
                 link=link,
                 content=content,
+                posted_at=posted_at,
             ))
         return announcements
 
@@ -188,16 +225,20 @@ class DeptScraper:
         resp.raise_for_status()
         return BeautifulSoup(resp.text, "lxml")
 
-    def _fetch_content(self, detail_url: str) -> str:
-        """Fetch full announcement text from detail page."""
+    def _fetch_detail(self, detail_url: str) -> tuple[str, str]:
+        """Return (content_text, posted_at) from a detail page."""
         try:
             soup = self._get_soup(detail_url)
+            content = ""
             content_div = soup.select_one(".gdlr-core-blog-content")
             if content_div:
-                return _html_to_text(str(content_div), max_chars=900)
+                content = _html_to_text(str(content_div), max_chars=900)
+            date_el = soup.select_one("span.gdlr-core-blog-info")
+            posted_at = _format_dept_date(date_el.get_text(strip=True)) if date_el else ""
+            return content, posted_at
         except Exception as exc:
             logger.warning("Dept detail fetch failed (%s): %s", detail_url, exc)
-        return ""
+        return "", ""
 
     def fetch_announcements(self) -> list[Announcement]:
         logger.info("Dept: fetching %s", DEPT_LIST)
@@ -228,7 +269,7 @@ class DeptScraper:
             ann_id = f"ceng_{slug}"
             full_url = urljoin(DEPT_BASE, href)
 
-            content = self._fetch_content(full_url)
+            content, posted_at = self._fetch_detail(full_url)
 
             announcements.append(Announcement(
                 id=ann_id,
@@ -236,6 +277,7 @@ class DeptScraper:
                 class_name=SOURCE_NAME,
                 link=full_url,
                 content=content,
+                posted_at=posted_at,
             ))
 
         logger.info("Dept total: %d", len(announcements))

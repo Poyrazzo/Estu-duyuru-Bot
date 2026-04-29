@@ -31,15 +31,16 @@ class TelegramNotifier:
             logger.error("Failed to send Telegram message: %s", exc)
             return False
 
-    def send_announcement(self, subject: str, class_name: str, link: str, content: str = "") -> bool:
-        content_line = ""
-        if content:
-            content_line = f"\n\n📄 <i>{self._escape(content)}</i>"
+    def send_announcement(self, subject: str, class_name: str, link: str,
+                          content: str = "", posted_at: str = "") -> bool:
+        date_line = f"\n🕐 <b>Tarih:</b> {self._escape(posted_at)}" if posted_at else ""
+        content_line = f"\n\n📄 <i>{self._escape(content)}</i>" if content else ""
 
         text = (
             "📢 <b>Yeni Duyuru!</b>\n\n"
             f"📚 <b>Kaynak:</b> {self._escape(class_name)}\n"
             f"📌 <b>Konu:</b> {self._escape(subject)}"
+            f"{date_line}"
             f"{content_line}\n\n"
             f"🔗 <a href=\"{link}\">{self._escape(link)}</a>"
         )

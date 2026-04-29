@@ -1,0 +1,21 @@
+{
+  "telegram": {
+    "api_token": "YOUR_TELEGRAM_BOT_TOKEN",
+    "chat_id": "YOUR_CHAT_ID"
+  },
+  "canvas": {
+    "base_url": "https://estuoys.eskisehir.edu.tr",
+    "access_token": "YOUR_CANVAS_ACCESS_TOKEN",
+    "course_ids": [],
+    "check_interval_seconds": 600,
+    "request_timeout_seconds": 30
+  },
+  "quiet_hours": {
+    "enabled": false,
+    "start": "23:00",
+    "end": "07:00"
+  },
+  "database": {
+    "path": "announcements.db"
+  }
+}

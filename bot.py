@@ -94,6 +94,7 @@ class Bot:
                     class_name=ann.class_name,
                     link=ann.link,
                     content=ann.content,
+                    posted_at=ann.posted_at,
                 )
                 if not ok:
                     self.db.enqueue(ann.id, ann.subject, ann.class_name, ann.link)

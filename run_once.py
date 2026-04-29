@@ -33,6 +33,7 @@ def _process(announcements, db, notifier):
             class_name=ann.class_name,
             link=ann.link,
             content=ann.content,
+            posted_at=ann.posted_at,
         )
         logger.info("Sent: [%s] %s", ann.class_name, ann.subject)
     return new_count
