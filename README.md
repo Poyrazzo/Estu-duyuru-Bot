@@ -27,6 +27,13 @@ Her yeni duyuru için Telegram'a şunları gönderir:
 Sunucu, Raspberry Pi veya telefon gerekmez — tamamen ücretsizdir.
 
 Duyuru ID'leri bir SQLite veritabanında saklanır; aynı duyuru için asla iki kez bildirim gelmez.
+Bir duyuru ancak Telegram kabul ettikten sonra "görüldü" işaretlenir — gönderim başarısız olursa
+bir sonraki çalıştırmada tekrar denenir, duyuru kaybolmaz.
+
+**Arızalar sessiz kalmaz:** Canvas jetonu geçersizse ya da bölüm sitesinin tasarımı değişip duyurular
+ayrıştırılamazsa Telegram'a uyarı gelir (aynı uyarı en fazla 12 saatte bir) ve Actions çalıştırması
+kırmızı olur. Repo 45 gündür boşta ise workflow, GitHub'ın zamanlanmış çalıştırmaları 60 gün sonra
+kapatmasını önlemek için boş bir "keepalive" commit'i atar.
 
 ---
 
@@ -50,6 +57,8 @@ Duyuru ID'leri bir SQLite veritabanında saklanır; aynı duyuru için asla iki 
 1. `https://estuoys.eskisehir.edu.tr` adresine giriş yap
 2. **Hesap → Ayarlar → Erişim Jetonları → Jeton Ekle**
 3. Oluşturulan jetonu kopyala *(yalnızca bir kez gösterilir)*
+4. Süresi dolunca (bot "Canvas Token Geçersiz" uyarısı gönderir) aynı adımlarla yenisini al ve
+   `gh secret set CANVAS_TOKEN` ile (ya da Settings → Secrets'tan) güncelle
 
 ### 4. Repoyu Fork'la ve Secrets Ekle
 
@@ -65,8 +74,8 @@ Bu repoyu fork'la, ardından **Settings → Secrets and variables → Actions** 
 
 **Actions → ESTÜ Canvas Duyuru Kontrolü → Run workflow**
 
-İlk çalıştırmada mevcut tüm duyurular "görüldü" olarak işaretlenir.  
-Bundan sonra yalnızca yeni gelenlerde bildirim alırsın.
+İlk çalıştırmada (veritabanı önbelleği silindiğinde de) mevcut tüm duyurular bildirim gönderilmeden
+"görüldü" olarak işaretlenir. Bundan sonra yalnızca yeni gelenlerde bildirim alırsın.
 
 ---
 
@@ -85,6 +94,13 @@ cp config.json.example config.json
 
 # Ya da tek seferlik kontrol
 venv/bin/python run_once.py
+
+# Sağlık kontrolü: Telegram token'ı, Canvas token'ı ve bölüm sitesi ayrıştırması çalışıyor mu?
+# (hiçbir mesaj göndermez)
+venv/bin/python run_once.py --check
+
+# Testler
+venv/bin/python -m unittest discover -s tests -t .
 ```
 
 ---
@@ -95,6 +111,8 @@ venv/bin/python run_once.py
 ├── bot.py          → Ana döngü (yerel çalıştırma için)
 ├── run_once.py     → Tek seferlik kontrol (GitHub Actions kullanır)
 ├── scraper.py      → Canvas API + bölüm sitesi scraper
+├── pipeline.py     → "Yeni mi? Gönder, başarılıysa kaydet" mantığı (ilk çalıştırmada sadece kaydeder)
+├── tests/          → Birim testleri (bölüm sitesi HTML örnekleri tests/fixtures altında)
 ├── db.py           → SQLite (görülen ID'ler + bildirim kuyruğu)
 ├── notifier.py     → Telegram Bot API entegrasyonu
 ├── quiet_hours.py  → Sessiz saat mantığı

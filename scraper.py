@@ -38,6 +38,10 @@ class TokenExpiredError(Exception):
     """Canvas returned 401 — token invalid or expired."""
 
 
+class LayoutChangedError(Exception):
+    """The page loaded fine but no announcements could be parsed from it."""
+
+
 # ─────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────
@@ -64,19 +68,28 @@ def _format_canvas_date(iso: str) -> str:
 
 
 def _format_dept_date(raw: str) -> str:
-    """Convert '28.04.2026 14:46:12' → '28 Nis 2026, 14:46'."""
+    """'2026-10-27T13:46:15' → '27 Eki 2026, 13:46'; date-only '2026-10-30' → '30 Eki 2026'."""
     if not raw:
         return ""
+    raw = raw.strip()
     try:
         from datetime import datetime
-        dt = datetime.strptime(raw.strip(), "%d.%m.%Y %H:%M:%S")
+        if "T" in raw:
+            dt = datetime.fromisoformat(raw)
+            fmt = "%d {m} %Y, %H:%M"
+        elif "-" in raw:
+            dt = datetime.strptime(raw, "%Y-%m-%d")
+            fmt = "%d {m} %Y"
+        else:
+            dt = datetime.strptime(raw, "%d.%m.%Y %H:%M:%S")
+            fmt = "%d {m} %Y, %H:%M"
         month_tr = _TR_MONTHS.get(dt.strftime("%b"), dt.strftime("%b"))
-        return dt.strftime(f"%d {month_tr} %Y, %H:%M")
+        return dt.strftime(fmt.replace("{m}", month_tr))
     except Exception:
         return raw
 
 
-def _html_to_text(html: str, max_chars: int = 900) -> str:
+def _html_to_text(html: str, max_chars: int = 2500) -> str:
     """Strip HTML tags and collapse whitespace."""
     if not html:
         return ""
@@ -145,9 +158,11 @@ class CanvasScraper:
                 params={"only_announcements": "true", "per_page": 50, "order_by": "recent_activity"},
             )
         except requests.HTTPError as exc:
-            if exc.response is not None and exc.response.status_code in (401, 403):
+            status = exc.response.status_code if exc.response is not None else None
+            if status == 401:
                 raise TokenExpiredError(str(exc)) from exc
-            logger.warning("HTTP error for course %s: %s", course_id, exc)
+            # 403/404 etc. usually mean this one course is restricted or concluded.
+            logger.warning("Skipping course %s (%s): HTTP %s", course_id, course_name, status)
             return []
 
         announcements = []
@@ -226,59 +241,60 @@ class DeptScraper:
         return BeautifulSoup(resp.text, "lxml")
 
     def _fetch_detail(self, detail_url: str) -> tuple[str, str]:
-        """Return (content_text, posted_at) from a detail page."""
+        """Return (content_text, posted_at) from a detail page; ('', '') on failure."""
         try:
             soup = self._get_soup(detail_url)
-            content = ""
-            content_div = soup.select_one(".gdlr-core-blog-content")
-            if content_div:
-                content = _html_to_text(str(content_div), max_chars=900)
-            date_el = soup.select_one("span.gdlr-core-blog-info")
-            posted_at = _format_dept_date(date_el.get_text(strip=True)) if date_el else ""
+            body = soup.select_one(".estu-content-body")
+            content = _html_to_text(str(body)) if body else ""
+            time_el = soup.select_one(".estu-detail-meta time[datetime]")
+            posted_at = _format_dept_date(time_el["datetime"]) if time_el else ""
             return content, posted_at
         except Exception as exc:
             logger.warning("Dept detail fetch failed (%s): %s", detail_url, exc)
         return "", ""
 
-    def fetch_announcements(self) -> list[Announcement]:
+    def list_announcements(self) -> list[Announcement]:
+        """Parse the list page only (cheap). Content is the short excerpt until enrich() runs.
+
+        Raises LayoutChangedError if the page loads but nothing can be parsed, so a site
+        redesign shows up as an alert instead of silently looking like "no news".
+        """
         logger.info("Dept: fetching %s", DEPT_LIST)
-        try:
-            soup = self._get_soup(DEPT_LIST)
-        except Exception as exc:
-            logger.warning("Dept list page failed: %s", exc)
-            return []
+        soup = self._get_soup(DEPT_LIST)
 
-        announcements = []
-        # Each announcement has 3 <a> tags with the same href (thumbnail, title, "Devamı").
-        # Only the one inside h3.gdlr-core-blog-title carries the real title.
-        links = soup.select('h3.gdlr-core-blog-title a[href*="/tr/Duyuru/Detay/"]')
-
+        announcements: list[Announcement] = []
         seen_hrefs: set[str] = set()
-        for a in links:
+        for a in soup.select('a.estu-announcement-item[href*="/tr/Duyuru/Detay/"]'):
             href = a.get("href", "")
-            if not href or href in seen_hrefs:
+            title_el = a.select_one(".estu-announcement-item__body > strong")
+            title = title_el.get_text(strip=True) if title_el else ""
+            if not href or not title or href in seen_hrefs:
                 continue
             seen_hrefs.add(href)
 
-            title = a.get_text(strip=True)
-            if not title:
-                continue
-
-            # Use the URL slug as stable unique ID, prefixed to avoid collision with Canvas IDs
-            slug = href.rstrip("/").split("/")[-1]
-            ann_id = f"ceng_{slug}"
-            full_url = urljoin(DEPT_BASE, href)
-
-            content, posted_at = self._fetch_detail(full_url)
-
+            excerpt_el = a.select_one(".estu-announcement-excerpt")
+            time_el = a.select_one("time[datetime]")
             announcements.append(Announcement(
-                id=ann_id,
+                # URL slug is the stable ID; prefix avoids collisions with Canvas IDs.
+                id=f"ceng_{href.rstrip('/').split('/')[-1]}",
                 subject=title,
                 class_name=SOURCE_NAME,
-                link=full_url,
-                content=content,
-                posted_at=posted_at,
+                link=urljoin(DEPT_BASE, href),
+                content=excerpt_el.get_text(" ", strip=True) if excerpt_el else "",
+                posted_at=_format_dept_date(time_el["datetime"]) if time_el else "",
             ))
 
+        if not announcements:
+            raise LayoutChangedError(
+                f"{DEPT_LIST} yüklendi ama hiç duyuru ayrıştırılamadı — site tasarımı değişmiş olabilir."
+            )
         logger.info("Dept total: %d", len(announcements))
         return announcements
+
+    def enrich(self, ann: Announcement) -> None:
+        """Replace the list excerpt with the full text/time from the detail page (in place)."""
+        content, posted_at = self._fetch_detail(ann.link)
+        if content:
+            ann.content = content
+        if posted_at:
+            ann.posted_at = posted_at

@@ -44,6 +44,12 @@ class Database:
                     created_at  TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
                 )
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS meta (
+                    key    TEXT PRIMARY KEY,
+                    value  TEXT NOT NULL
+                )
+            """)
         logger.debug("Database schema initialized at %s", self.db_path)
 
     def is_seen(self, ann_id: str) -> bool:
@@ -58,6 +64,30 @@ class Database:
             conn.execute(
                 "INSERT OR IGNORE INTO announcements (id, subject, class_name, link) VALUES (?, ?, ?, ?)",
                 (ann_id, subject, class_name, link),
+            )
+
+    def count_seen(self, id_prefix: str | None = None, exclude_prefix: str | None = None) -> int:
+        sql, args = "SELECT COUNT(*) FROM announcements WHERE 1=1", []
+        if id_prefix:
+            sql += " AND id LIKE ? ESCAPE '\\'"
+            args.append(id_prefix.replace("_", "\\_") + "%")
+        if exclude_prefix:
+            sql += " AND id NOT LIKE ? ESCAPE '\\'"
+            args.append(exclude_prefix.replace("_", "\\_") + "%")
+        with self._connect() as conn:
+            return conn.execute(sql, args).fetchone()[0]
+
+    def get_meta(self, key: str) -> str | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+            return row["value"] if row else None
+
+    def set_meta(self, key: str, value: str):
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
             )
 
     def enqueue(self, ann_id: str, subject: str, class_name: str, link: str):

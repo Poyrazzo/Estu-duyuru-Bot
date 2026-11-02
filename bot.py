@@ -10,6 +10,7 @@ from pathlib import Path
 
 from db import Database
 from notifier import TelegramNotifier
+from pipeline import process
 from quiet_hours import is_quiet_now
 from scraper import CanvasScraper, DeptScraper, TokenExpiredError
 
@@ -69,68 +70,32 @@ class Bot:
         logger.info("Shutdown signal received.")
         self._running = False
 
-    def _flush_queued(self):
-        for item in self.db.flush_queue():
-            self.notifier.send_announcement(
-                subject=item["subject"],
-                class_name=item["class_name"],
-                link=item["link"],
-                content=item.get("content", ""),
-            )
-
-    def _process(self, announcements, in_quiet: bool):
-        new = 0
-        for ann in announcements:
-            if self.db.is_seen(ann.id):
-                continue
-            new += 1
-            self.db.mark_seen(ann.id, ann.subject, ann.class_name, ann.link)
-            if in_quiet:
-                self.db.enqueue(ann.id, ann.subject, ann.class_name, ann.link)
-                logger.info("Queued (quiet hours): [%s] %s", ann.class_name, ann.subject)
-            else:
-                ok = self.notifier.send_announcement(
-                    subject=ann.subject,
-                    class_name=ann.class_name,
-                    link=ann.link,
-                    content=ann.content,
-                    posted_at=ann.posted_at,
-                )
-                if not ok:
-                    self.db.enqueue(ann.id, ann.subject, ann.class_name, ann.link)
-        return new
-
     def _check_cycle(self):
-        quiet_enabled = self.quiet_cfg.get("enabled", False)
-        in_quiet = quiet_enabled and is_quiet_now(
-            self.quiet_cfg.get("start", "23:00"),
-            self.quiet_cfg.get("end", "07:00"),
-        )
+        quiet = self.quiet_cfg
+        if quiet.get("enabled", False) and is_quiet_now(quiet.get("start", "23:00"), quiet.get("end", "07:00")):
+            # Nothing is marked as seen during quiet hours, so everything new is delivered afterwards.
+            logger.info("Quiet hours — skipping this cycle.")
+            return
 
-        if not in_quiet and quiet_enabled:
-            self._flush_queued()
+        total_sent = 0
 
-        total_new = 0
-
-        # Canvas
         try:
-            anns = self.canvas.fetch_all_announcements(self.course_ids)
-            total_new += self._process(anns, in_quiet)
+            stats = process("canvas", self.canvas.fetch_all_announcements(self.course_ids), self.db, self.notifier)
+            total_sent += stats.sent
         except TokenExpiredError as exc:
             logger.error("%s", exc)
             self.notifier.send_token_expired_alert()
 
-        # Department site
         try:
-            anns = self.dept.fetch_announcements()
-            total_new += self._process(anns, in_quiet)
+            stats = process("dept", self.dept.list_announcements(), self.db, self.notifier, enrich=self.dept.enrich)
+            total_sent += stats.sent
         except Exception as exc:
             logger.warning("Dept scraper error: %s", exc)
 
-        if total_new == 0:
+        if total_sent == 0:
             logger.info("No new announcements.")
         else:
-            logger.info("Sent %d new notification(s).", total_new)
+            logger.info("Sent %d new notification(s).", total_sent)
 
     def run(self):
         logger.info("=" * 60)
